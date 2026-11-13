@@ -13,6 +13,7 @@ use Illuminate\Console\Command;
 use Illuminate\Encryption\Encrypter;
 use Illuminate\Support\Composer;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Redis;
 use RuntimeException;
 use Throwable;
@@ -69,6 +70,20 @@ class SetupCommand extends Command
 
         $this->replaceEnvironmentFile($environmentFile, $environmentPath);
         $this->callSilently('config:clear');
+
+        if (! $this->installProductionDependencies()) {
+            $this->components->error('composer install --no-dev failed. .env is already written: fix the error above, then run composer install --no-dev and build the frontend.');
+
+            return self::FAILURE;
+        }
+
+        $packageManager = $this->nodePackageManager();
+
+        if (! $this->buildFrontend($packageManager)) {
+            $this->components->error("The frontend build failed. .env is already written: fix the error above, then run {$packageManager} install && {$packageManager} run build.");
+
+            return self::FAILURE;
+        }
 
         $this->components->info('MataSecret is configured. Next steps:');
 
@@ -284,6 +299,8 @@ class SetupCommand extends Command
             $warnings[] = 'The current .env will be backed up and replaced. The new APP_KEY signs everyone out and makes stored secrets unreadable.';
         }
 
+        $warnings[] = 'Development dependencies will be removed (composer install --no-dev) and the frontend will be built for production.';
+
         foreach ($warnings as $warning) {
             $this->components->warn($warning);
         }
@@ -315,12 +332,8 @@ class SetupCommand extends Command
             $snapshot[$path] = File::exists($path) ? File::get($path) : null;
         }
 
-        $output = function (string $type, string $line): void {
-            $this->output->write($line);
-        };
-
-        $installed = ($stale === [] || $composer->removePackages($stale, output: $output))
-            && ($missing === [] || $composer->requirePackages($missing, output: $output));
+        $installed = ($stale === [] || $composer->removePackages($stale, output: $this->writeProcessOutput(...)))
+            && ($missing === [] || $composer->requirePackages($missing, output: $this->writeProcessOutput(...)));
 
         if (! $installed) {
             foreach ($snapshot as $path => $contents) {
@@ -331,6 +344,46 @@ class SetupCommand extends Command
         }
 
         return $installed;
+    }
+
+    /**
+     * Install what composer.lock lists for production, leaving out the development tools.
+     */
+    private function installProductionDependencies(): bool
+    {
+        /** @var Composer $composer */
+        $composer = $this->laravel->make('composer');
+
+        return Process::path(base_path())
+            ->forever()
+            ->run([...$composer->findComposer(), 'install', '--no-dev', '--optimize-autoloader', '--no-interaction'], $this->writeProcessOutput(...))
+            ->successful();
+    }
+
+    /**
+     * pnpm when it is installed, npm otherwise.
+     */
+    private function nodePackageManager(): string
+    {
+        return Process::run('command -v pnpm')->successful() ? 'pnpm' : 'npm';
+    }
+
+    private function buildFrontend(string $packageManager): bool
+    {
+        foreach ([[$packageManager, 'install'], [$packageManager, 'run', 'build']] as $command) {
+            $result = Process::path(base_path())->forever()->run($command, $this->writeProcessOutput(...));
+
+            if ($result->failed()) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function writeProcessOutput(string $type, string $line): void
+    {
+        $this->output->write($line);
     }
 
     /**

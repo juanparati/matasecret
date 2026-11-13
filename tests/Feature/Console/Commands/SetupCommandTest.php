@@ -3,9 +3,12 @@
 namespace Tests\Feature\Console\Commands;
 
 use Dotenv\Dotenv;
+use Illuminate\Contracts\Process\ProcessResult;
+use Illuminate\Process\PendingProcess;
 use Illuminate\Redis\Connections\Connection;
 use Illuminate\Support\Composer;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Str;
 use Illuminate\Testing\PendingCommand;
@@ -35,10 +38,14 @@ class SetupCommandTest extends TestCase
         parent::tearDown();
     }
 
-    public function test_frankenphp_with_its_own_certificate_writes_the_environment_without_installing_packages(): void
+    public function test_frankenphp_with_its_own_certificate_installs_octane_and_builds_for_production(): void
     {
         $composer = $this->composer();
-        $composer->shouldNotReceive('requirePackages', 'removePackages');
+        $composer->shouldReceive('requirePackages')
+            ->once()
+            ->with(['laravel/octane'], false, Mockery::type('Closure'))
+            ->andReturn(true);
+        $composer->shouldNotReceive('removePackages');
 
         $this->artisan('setup')
             ->expectsQuestion('Which web server will run MataSecret?', 'frankenphp')
@@ -55,8 +62,13 @@ class SetupCommandTest extends TestCase
             ->expectsOutputToContain('gith••••••')
             ->doesntExpectOutputToContain('github-client-secret')
             ->expectsOutputToContain('https://secrets.example.com/auth/callback')
+            ->expectsOutputToContain('Development dependencies will be removed (composer install --no-dev)')
             ->expectsOutputToContain('php artisan octane:start --server=frankenphp --https --http-redirect')
             ->assertSuccessful();
+
+        $this->assertRan(['composer', 'install', '--no-dev', '--optimize-autoloader', '--no-interaction']);
+        $this->assertRan(['pnpm', 'install']);
+        $this->assertRan(['pnpm', 'run', 'build']);
 
         $environment = $this->writtenEnvironment();
         $expected = [
@@ -91,7 +103,11 @@ class SetupCommandTest extends TestCase
 
     public function test_frankenphp_behind_a_reverse_proxy_listens_locally_and_trusts_the_proxy(): void
     {
-        $this->composer();
+        $composer = $this->composer();
+        $composer->shouldReceive('requirePackages')
+            ->once()
+            ->with(['laravel/octane'], false, Mockery::type('Closure'))
+            ->andReturn(true);
 
         $this->artisan('setup')
             ->expectsQuestion('Which web server will run MataSecret?', 'frankenphp')
@@ -219,10 +235,10 @@ class SetupCommandTest extends TestCase
 
     public function test_removes_packages_from_a_previous_setup_that_are_no_longer_needed(): void
     {
-        $composer = $this->composer(installed: ['socialiteproviders/okta', 'symfony/postmark-mailer', 'symfony/http-client']);
+        $composer = $this->composer(installed: ['laravel/octane', 'socialiteproviders/okta', 'symfony/postmark-mailer', 'symfony/http-client']);
         $composer->shouldReceive('removePackages')
             ->once()
-            ->with(['socialiteproviders/okta', 'symfony/http-client', 'symfony/postmark-mailer'], false, Mockery::type('Closure'))
+            ->with(['laravel/octane', 'socialiteproviders/okta', 'symfony/http-client', 'symfony/postmark-mailer'], false, Mockery::type('Closure'))
             ->andReturn(true);
         $composer->shouldNotReceive('requirePackages');
 
@@ -231,6 +247,44 @@ class SetupCommandTest extends TestCase
             ->assertSuccessful();
 
         $this->assertSame('gitlab', $this->writtenEnvironment()['AUTH_PROVIDER']);
+    }
+
+    public function test_falls_back_to_npm_when_pnpm_is_not_installed(): void
+    {
+        $this->composer(processes: ['command -v pnpm' => Process::result(exitCode: 1)]);
+
+        $this->runWithGitLabAndNoMailer()
+            ->expectsConfirmation('Apply this configuration?', 'yes')
+            ->assertSuccessful();
+
+        $this->assertRan(['npm', 'install']);
+        $this->assertRan(['npm', 'run', 'build']);
+        Process::assertDidntRun(fn (PendingProcess $process): bool => $process->command === ['pnpm', 'install']);
+    }
+
+    public function test_failed_production_install_stops_before_building_the_frontend(): void
+    {
+        $this->composer(processes: ['*--no-dev*' => Process::result(exitCode: 1)]);
+
+        $this->runWithGitLabAndNoMailer()
+            ->expectsConfirmation('Apply this configuration?', 'yes')
+            ->expectsOutputToContain('composer install --no-dev failed. .env is already written')
+            ->doesntExpectOutputToContain('MataSecret is configured.')
+            ->assertFailed();
+
+        $this->assertSame('gitlab', $this->writtenEnvironment()['AUTH_PROVIDER']);
+        Process::assertDidntRun(fn (PendingProcess $process): bool => $process->command === ['pnpm', 'install']);
+    }
+
+    public function test_failed_frontend_build_reports_the_command_to_run_again(): void
+    {
+        $this->composer(processes: ["*'run' 'build'*" => Process::result(exitCode: 1)]);
+
+        $this->runWithGitLabAndNoMailer()
+            ->expectsConfirmation('Apply this configuration?', 'yes')
+            ->expectsOutputToContain('The frontend build failed. .env is already written: fix the error above, then run pnpm install && pnpm run build.')
+            ->doesntExpectOutputToContain('MataSecret is configured.')
+            ->assertFailed();
     }
 
     public function test_warns_when_the_provider_does_not_verify_email_addresses(): void
@@ -338,17 +392,30 @@ class SetupCommandTest extends TestCase
     }
 
     /**
-     * Replace Composer, which would otherwise change this project's dependencies.
+     * Replace Composer and the processes setup runs, which would otherwise change this
+     * project's dependencies. Every process succeeds unless $processes says otherwise.
      *
      * @param  list<string>  $installed
+     * @param  array<string, ProcessResult>  $processes
      */
-    private function composer(array $installed = []): MockInterface
+    private function composer(array $installed = [], array $processes = []): MockInterface
     {
         $composer = Mockery::mock(Composer::class);
         $composer->shouldReceive('hasPackage')->andReturnUsing(fn (string $package): bool => in_array($package, $installed, true));
+        $composer->shouldReceive('findComposer')->andReturn(['composer']);
         $this->app->instance('composer', $composer);
 
+        Process::fake([...$processes, '*' => Process::result()]);
+
         return $composer;
+    }
+
+    /**
+     * @param  list<string>  $command
+     */
+    private function assertRan(array $command): void
+    {
+        Process::assertRan(fn (PendingProcess $process): bool => $process->command === $command && $process->path === base_path());
     }
 
     private function redisAnswers(bool $responds = true): void

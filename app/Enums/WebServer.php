@@ -16,6 +16,30 @@ enum WebServer: string
     }
 
     /**
+     * The Composer package this server needs, or null when it needs none.
+     */
+    public function package(): ?string
+    {
+        return match ($this) {
+            self::FrankenPhp => 'laravel/octane',
+            self::Traditional => null,
+        };
+    }
+
+    /**
+     * Every package any server can add, used to remove the ones no longer needed.
+     *
+     * @return list<string>
+     */
+    public static function catalog(): array
+    {
+        return array_values(array_filter(array_map(
+            fn (self $server): ?string => $server->package(),
+            self::cases(),
+        )));
+    }
+
+    /**
      * @return array<string, string>
      */
     public static function options(): array

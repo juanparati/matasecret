@@ -133,13 +133,14 @@ final readonly class SetupAnswers
     }
 
     /**
-     * The Composer packages the chosen provider and mailer need.
+     * The Composer packages the chosen web server, provider and mailer need.
      *
      * @return list<string>
      */
     public function packages(): array
     {
         return array_values(array_unique(array_filter([
+            $this->webServer->package(),
             $this->authProvider->package(),
             ...$this->mailProvider->packages(),
         ])));
@@ -152,7 +153,7 @@ final readonly class SetupAnswers
      */
     public static function managedPackages(): array
     {
-        return array_values(array_unique([...AuthProvider::catalog(), ...MailProvider::catalog()]));
+        return array_values(array_unique([...WebServer::catalog(), ...AuthProvider::catalog(), ...MailProvider::catalog()]));
     }
 
     /**
@@ -266,10 +267,7 @@ final readonly class SetupAnswers
      */
     public function nextSteps(string $publicPath): array
     {
-        $steps = [
-            "Register this redirect URI with {$this->authProvider->label()}: {$this->redirectUri()}",
-            'Build the frontend assets: pnpm install && pnpm run build',
-        ];
+        $steps = ["Register this redirect URI with {$this->authProvider->label()}: {$this->redirectUri()}"];
 
         if ($this->webServer === WebServer::Traditional) {
             $steps[] = "Point the document root of {$this->domain} at {$publicPath} and reload PHP-FPM.";
